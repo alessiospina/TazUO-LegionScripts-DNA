@@ -12,6 +12,9 @@ class Pergamena:
         self.livello = livello
         self.seriale = seriale
 
+    def __lt__(self, other):
+        return self.livello < other.livello
+
 
 class PergamenaLauncher:
 
@@ -20,26 +23,16 @@ class PergamenaLauncher:
     @staticmethod
     def parse_level(name):
         m = re.search(r'(\d+)\s+Liv', name)
-        return int(m.group(1)) if m else 0
+        return int(m.group(1)) if m else None
 
     @staticmethod
     def build_list(items):
         pergamene = []
         for item in items:
-            pergamene.append(Pergamena(item.Name, PergamenaLauncher.parse_level(item.Name), item.Serial))
+            lv = PergamenaLauncher.parse_level(item.Name)
+            if lv is not None:
+                pergamene.append(Pergamena(item.Name, lv, item.Serial))
         return pergamene
-
-    @staticmethod
-    def sort_by_level(pergamene):
-        i = 1
-        while i < len(pergamene):
-            current = pergamene[i]
-            j = i - 1
-            while j >= 0 and pergamene[j].livello < current.livello:
-                pergamene[j + 1] = pergamene[j]
-                j -= 1
-            pergamene[j + 1] = current
-            i += 1
 
     @staticmethod
     def launch(scelta):
@@ -58,7 +51,10 @@ class PergamenaLauncher:
             API.SysMsg("[PergamenaLauncher] Nessuna pergamena trovata nello zaino.")
             return
         pergamene = PergamenaLauncher.build_list(items)
-        PergamenaLauncher.sort_by_level(pergamene)
+        if not pergamene:
+            API.SysMsg("[PergamenaLauncher] Nessuna pergamena lanciabile trovata.")
+            return
+        pergamene.sort(reverse=True)
         PergamenaLauncher.launch(pergamene[0])
 
 
