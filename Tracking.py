@@ -15,12 +15,12 @@ def has_tracking_gump():
     return False
 
 def main():
-    API.SysMsg("[Tracking] Avviato.")
+    API.SysMsg(f"[{API.ScriptName}] Avviato.")
     while True:
         API.Msg(".segui_tracce 1")
         API.Pause(1)
         if has_tracking_gump():
-            API.SysMsg("[Tracking] Player Individuati")
+            API.SysMsg(f"[{API.ScriptName}] Player Individuati")
             API.Msg(".c TRACCO GENTE")
             API.SetWarMode(False)
             API.ReplyGump(1)
