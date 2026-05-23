@@ -22,7 +22,9 @@ def main():
         if has_tracking_gump():
             API.SysMsg("[Tracking] Player Individuati")
             API.Msg(".c TRACCO GENTE")
-            break
+            API.SetWarMode(False)
+            API.ReplyGump(1)
+            return        
         API.Pause(7)
 
 main()
