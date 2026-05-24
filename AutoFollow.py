@@ -8,12 +8,11 @@ import API
 import re
 
 FOOD_SERIALS = [
-    # inserisci qui i seriali del cibo, es: 0x12345678
+    # inserisci qui i seriali grafici del cibo
     0x09EA, # pomodori
     0x0C66, # patate
     0x0EEF, # piselli
 ]
-
 
 class Command:
     name    = ""
@@ -44,9 +43,12 @@ class FollowCommand(Command):
                 API.SetWarMode(False)
                 API.Msg(".nasconditi")
         else:
-            API.AutoFollow(serial)
-            API.SysMsg("[AutoFollow] Seguo " + (entry.Name or "?") + " (" + hex(serial) + ")")
-
+            if not API.Pathfinding():
+                API.SysMsg("[AutoFollow] Non sono in pathfinding")
+                API.AutoFollow(serial)
+                API.SysMsg("[AutoFollow] Seguo " + (entry.Name or "?") + " (" + hex(serial) + ")")
+            else: 
+                API.SysMsg("[AutoFollow] Già in pathfinding")
 
 class StopCommand(Command):
     name    = "Stop"
@@ -127,8 +129,13 @@ class UseItemOnGroundCommand(Command):
 class AutoFollow:
 
     def __init__(self):
-        self.arrive_distance = 5
-        self.commands        = [FollowCommand(self.arrive_distance), StopCommand(), EatFromBagCommand(FOOD_SERIALS), UseItemOnGroundCommand()]
+        self.arrive_distance = 10
+        self.commands        = [
+            FollowCommand(self.arrive_distance), 
+            StopCommand(), 
+            EatFromBagCommand(FOOD_SERIALS), 
+            UseItemOnGroundCommand()
+        ]
         self.last_command    = None
 
     def party_names(self):
