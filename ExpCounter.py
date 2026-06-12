@@ -1,7 +1,6 @@
 # Autore:      Alessio Spina
-# Descrizione: Contatore EXP in-game con gump grafico. Traccia PX totali,
-#              kill, media per kill, PX/ora e kill/ora per sessione.
-#              Supporta pausa, reset e storico sessioni salvato su JSON.
+# Descrizione: Contatore EXP. Traccia PX, kill, media, PX/h e kill/h.
+#              Salva nome sessione, coordinate e mappa su JSON.
 
 import API
 import re
@@ -9,23 +8,50 @@ import os
 import json
 from datetime import datetime
 
-# --- Percorso file dati ---
-DATA_FILE = os.path.join(os.path.dirname(API.ScriptPath), "exp_sessions.json")
+DATA_FILE  = os.path.join(os.path.dirname(API.ScriptPath), "exp_sessions.json")
+DT_FMT     = "%Y-%m-%dT%H:%M:%S"
+MAP_NAMES  = {0: "Felucca", 1: "Trammel", 2: "Ilshenar", 3: "Malas", 4: "Tokuno", 5: "TerMur"}
 
-# --- Stato sessione corrente ---
-session_start     = datetime.now()
-total_exp         = 0
-kill_count        = 0
-exp_per_kill      = []
+# --- Stato sessione ---
+session_name   = "Sessione"
+session_map    = ""
+session_coords = (0, 0, 0)
+session_start  = datetime.now()
+total_exp      = 0
+kill_count     = 0
+exp_per_kill   = []
 last_journal_time = None
 
-# --- Stato pausa ---
-paused       = False
-paused_at    = None
-total_paused = 0.0   # secondi totali trascorsi in pausa
+paused           = False
+paused_at        = None
+total_paused     = 0.0
+session_active   = False
+waiting_for_name = False
+name_dialog      = None
+name_textbox     = None
 
-# --- Regex PX dal journal ---
 PX_PATTERN = re.compile(r"hai guadagnato\s+([\d\.,]+)\s*px", re.IGNORECASE)
+
+# -----------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------
+def get_map_name():
+    return MAP_NAMES.get(API.GetMap(), "Mappa " + str(API.GetMap()))
+
+def snapshot_location():
+    return (API.Player.X, API.Player.Y, API.Player.Z), get_map_name()
+
+def fmt_time(seconds):
+    s = max(int(seconds), 0)
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+def fmt_num(n):
+    return f"{int(n):,}".replace(",", ".")
+
+def get_elapsed():
+    raw = (datetime.now() - session_start).total_seconds()
+    cur = (datetime.now() - paused_at).total_seconds() if (paused and paused_at) else 0.0
+    return max(raw - total_paused - cur, 0.0)
 
 # -----------------------------------------------------------------------
 # Persistenza
@@ -39,11 +65,14 @@ def load_sessions():
             pass
     return []
 
-def save_session(start_dt, end_dt, t_exp, k_count, t_paused_sec, kills):
+def save_session(start_dt, end_dt, t_exp, k_count, t_paused_sec, kills, name, coords, map_name):
     sessions = load_sessions()
     sessions.append({
-        "start":      start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        "end":        end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "name":       name,
+        "map":        map_name,
+        "coords":     list(coords),
+        "start":      start_dt.strftime(DT_FMT),
+        "end":        end_dt.strftime(DT_FMT),
         "total_exp":  t_exp,
         "kill_count": k_count,
         "paused_sec": int(t_paused_sec),
@@ -56,246 +85,231 @@ def save_session(start_dt, end_dt, t_exp, k_count, t_paused_sec, kills):
         API.SysMsg(f"ExpCounter: errore salvataggio: {e}")
 
 # -----------------------------------------------------------------------
-# Costruzione del gump principale
+# Gump principale
 # -----------------------------------------------------------------------
-W, H = 320, 340
+W, H  = 300, 284
+y0    = 46
+ROW   = 28
 
-gump = API.Gumps.CreateModernGump(100, 100, W, H, resizable=False)
+gump = API.Gumps.CreateModernGump(80, 80, W, H, resizable=False)
+gump.SetBorderSize(3)
 
-# sfondo
-bg = API.Gumps.CreateGumpColorBox(0.82, "#0D0D0D")
+bg = API.Gumps.CreateGumpColorBox(0.93, "#0C0C14")
 bg.SetRect(0, 0, W, H)
 gump.Add(bg)
 
-# titolo
-title = API.Gumps.CreateGumpTTFLabel("  EXP Counter", 16, "#FFD700", "alagard")
-title.SetRect(0, 8, W - 70, 24)
-gump.Add(title)
+# header background leggermente diverso
+hdr_bg = API.Gumps.CreateGumpColorBox(0.40, "#1A1A2E")
+hdr_bg.SetRect(0, 0, W, y0 - 4)
+gump.Add(hdr_bg)
 
-# indicatore stato LIVE (verde) / PAUSA (giallo) — sovrapposti, uno alla volta visibile
-lbl_status_live = API.Gumps.CreateGumpTTFLabel("● LIVE", 11, "#00FF99")
-lbl_status_live.SetRect(W - 68, 10, 64, 18)
-gump.Add(lbl_status_live)
+lbl_name = API.Gumps.CreateGumpTTFLabel("EXP Counter", 17, "#E8C030", "alagard")
+lbl_name.SetRect(8, 7, 145, 28)
+gump.Add(lbl_name)
 
-lbl_status_paused = API.Gumps.CreateGumpTTFLabel("● PAUSA", 11, "#FFAA00")
-lbl_status_paused.SetRect(W - 68, 10, 64, 18)
-lbl_status_paused.SetAlpha(0.0)
-gump.Add(lbl_status_paused)
+lbl_status_live   = API.Gumps.CreateGumpTTFLabel("● LIVE",  13, "#00E87A")
+lbl_status_paused = API.Gumps.CreateGumpTTFLabel("● PAUSA", 13, "#FF9900")
+lbl_status_live.SetRect(154, 10, 58, 22)
+lbl_status_paused.SetRect(154, 10, 58, 22)
 
-# separatore titolo
-sep_top = API.Gumps.CreateGumpColorBox(0.9, "#FFD700")
-sep_top.SetRect(8, 34, W - 16, 2)
-gump.Add(sep_top)
-
-# --- statistiche ---
-lbl_total_head = API.Gumps.CreateGumpTTFLabel("PX Totali:", 13, "#AAAAAA")
-lbl_total_head.SetRect(12, 44, 120, 20)
-gump.Add(lbl_total_head)
-
-lbl_total = API.Gumps.CreateGumpTTFLabel("0", 13, "#00FF99")
-lbl_total.SetRect(140, 44, 170, 20)
-gump.Add(lbl_total)
-
-lbl_kill_head = API.Gumps.CreateGumpTTFLabel("Mostri uccisi:", 13, "#AAAAAA")
-lbl_kill_head.SetRect(12, 66, 120, 20)
-gump.Add(lbl_kill_head)
-
-lbl_kill = API.Gumps.CreateGumpTTFLabel("0", 13, "#00CFFF")
-lbl_kill.SetRect(140, 66, 170, 20)
-gump.Add(lbl_kill)
-
-lbl_avg_head = API.Gumps.CreateGumpTTFLabel("Media / kill:", 13, "#AAAAAA")
-lbl_avg_head.SetRect(12, 88, 120, 20)
-gump.Add(lbl_avg_head)
-
-lbl_avg = API.Gumps.CreateGumpTTFLabel("0", 13, "#FFAA00")
-lbl_avg.SetRect(140, 88, 170, 20)
-gump.Add(lbl_avg)
-
-lbl_time_head = API.Gumps.CreateGumpTTFLabel("Durata:", 13, "#AAAAAA")
-lbl_time_head.SetRect(12, 110, 120, 20)
-gump.Add(lbl_time_head)
-
-lbl_time = API.Gumps.CreateGumpTTFLabel("00:00:00", 13, "#FFFFFF")
-lbl_time.SetRect(140, 110, 170, 20)
-gump.Add(lbl_time)
-
-lbl_rate_head = API.Gumps.CreateGumpTTFLabel("PX / ora:", 13, "#AAAAAA")
-lbl_rate_head.SetRect(12, 132, 120, 20)
-gump.Add(lbl_rate_head)
-
-lbl_rate = API.Gumps.CreateGumpTTFLabel("0", 13, "#FF6688")
-lbl_rate.SetRect(140, 132, 170, 20)
-gump.Add(lbl_rate)
-
-lbl_kph_head = API.Gumps.CreateGumpTTFLabel("Kill / ora:", 13, "#AAAAAA")
-lbl_kph_head.SetRect(12, 154, 120, 20)
-gump.Add(lbl_kph_head)
-
-lbl_kph = API.Gumps.CreateGumpTTFLabel("0", 13, "#88CCFF")
-lbl_kph.SetRect(140, 154, 170, 20)
-gump.Add(lbl_kph)
-
-lbl_last_head = API.Gumps.CreateGumpTTFLabel("Ultimo PX:", 13, "#AAAAAA")
-lbl_last_head.SetRect(12, 176, 120, 20)
-gump.Add(lbl_last_head)
-
-lbl_last = API.Gumps.CreateGumpTTFLabel("-", 13, "#EEDD88")
-lbl_last.SetRect(140, 176, 170, 20)
-gump.Add(lbl_last)
-
-# separatore
-sep_mid = API.Gumps.CreateGumpColorBox(0.6, "#555555")
-sep_mid.SetRect(8, 202, W - 16, 1)
-gump.Add(sep_mid)
-
-# ultimi guadagni in scroll area
-lbl_recent_head = API.Gumps.CreateGumpTTFLabel("  Ultimi guadagni:", 11, "#888888")
-lbl_recent_head.SetRect(8, 208, W - 16, 16)
-gump.Add(lbl_recent_head)
-
-sa = API.Gumps.CreateGumpScrollArea(8, 226, W - 16, 58)
-gump.Add(sa)
-
-recent_labels = []
-for i in range(8):
-    rl = API.Gumps.CreateGumpTTFLabel("", 11, "#CCCCCC")
-    rl.SetRect(2, i * 16, W - 24, 16)
-    sa.Add(rl)
-    recent_labels.append(rl)
-
-# separatore pulsanti
-sep_btn = API.Gumps.CreateGumpColorBox(0.6, "#555555")
-sep_btn.SetRect(8, 284, W - 16, 1)
-gump.Add(sep_btn)
-
-# --- Riga 1: [Pausa] [Riprendi] [Nuovo] ---
-BW = 88
-BH = 20
-GAP = 4
-# 3 bottoni centrati: margine sinistro = (320 - 3*88 - 2*4) / 2 = 24
-x0 = (W - 3 * BW - 2 * GAP) // 2
-
-btn_pausa = API.Gumps.CreateSimpleButton("Pausa", BW, BH)
-btn_pausa.SetRect(x0, 289, BW, BH)
-gump.Add(btn_pausa)
-
-btn_riprendi = API.Gumps.CreateSimpleButton("Riprendi", BW, BH)
-btn_riprendi.SetRect(x0 + BW + GAP, 289, BW, BH)
-gump.Add(btn_riprendi)
-
-btn_nuovo = API.Gumps.CreateSimpleButton("Nuovo", BW, BH)
-btn_nuovo.SetRect(x0 + (BW + GAP) * 2, 289, BW, BH)
-gump.Add(btn_nuovo)
-
-# separatore riga 2
-sep_btn2 = API.Gumps.CreateGumpColorBox(0.6, "#555555")
-sep_btn2.SetRect(8, 313, W - 16, 1)
-gump.Add(sep_btn2)
-
-# --- Riga 2: [Storico] centrato ---
-btn_storico = API.Gumps.CreateSimpleButton("Storico sessioni", 112, BH)
-btn_storico.SetRect(W // 2 - 56, 317, 112, BH)
+btn_storico = API.Gumps.CreateSimpleButton("Storico", 52, 22)
+btn_storico.DisplayBorder = True
+btn_storico.AlwaysShowBackground = True
+btn_storico.SetBackgroundColor(60, 40, 100, 200)
+btn_storico.SetRect(214, 10, 52, 22)
 gump.Add(btn_storico)
 
+btn_close = API.Gumps.CreateSimpleButton("X", 26, 26)
+btn_close.DisplayBorder = True
+btn_close.AlwaysShowBackground = True
+btn_close.SetBackgroundColor(180, 30, 30, 220)
+btn_close.SetRect(W - 30, 6, 26, 26)
+gump.Add(btn_close)
+lbl_status_paused.SetAlpha(0.0)
+gump.Add(lbl_status_live)
+gump.Add(lbl_status_paused)
+
+sep_gold = API.Gumps.CreateGumpColorBox(1.0, "#E8C030")
+sep_gold.SetRect(0, y0 - 4, W, 2)
+gump.Add(sep_gold)
+
+def add_row(label, y, color_val):
+    lh = API.Gumps.CreateGumpTTFLabel(label, 13, "#FFFFFF")
+    lh.SetRect(12, y, 110, 20)
+    gump.Add(lh)
+    lv = API.Gumps.CreateGumpTTFLabel("—", 18, color_val)
+    lv.SetRect(126, y - 3, W - 136, 24)
+    gump.Add(lv)
+    return lv
+
+lbl_total = add_row("PX totali",  y0,          "#00E87A")
+lbl_kill  = add_row("Kill",       y0 + ROW,    "#00CCFF")
+lbl_avg   = add_row("Media/kill", y0 + ROW*2,  "#FF9900")
+lbl_time  = add_row("Durata",     y0 + ROW*3,  "#E0E0E0")
+lbl_rate  = add_row("PX/ora",     y0 + ROW*4,  "#FF5577")
+lbl_kph   = add_row("Kill/ora",   y0 + ROW*5,  "#77AAFF")
+lbl_last  = add_row("Ultimo PX",  y0 + ROW*6,  "#DDCC55")
+
+sep_mid = API.Gumps.CreateGumpColorBox(0.6, "#2A2A3A")
+sep_mid.SetRect(0, y0 + ROW*7 + 5, W, 2)
+gump.Add(sep_mid)
+
+# Bottoni riga 1 — colorati
+BW, BH, GAP = 128, 28, 12
+x0b   = (W - 2*BW - GAP) // 2
+btn_y = y0 + ROW*7 + 10
+
+def make_btn(label, r, g, b, w=BW):
+    btn = API.Gumps.CreateSimpleButton(label, w, BH)
+    btn.DisplayBorder = True
+    btn.AlwaysShowBackground = True
+    btn.SetBackgroundColor(r, g, b, 210)
+    return btn
+
+btn_toggle = make_btn("Pausa",  180,  90,  15)
+btn_nuovo  = make_btn("Nuovo",   30,  90, 190)
+btn_toggle.SetRect(x0b,          btn_y, BW, BH)
+btn_nuovo.SetRect(x0b + BW+GAP,  btn_y, BW, BH)
+btn_toggle.SetAlpha(0.0)
+gump.Add(btn_toggle)
+gump.Add(btn_nuovo)
+
+
 # -----------------------------------------------------------------------
-# Callback chiusura → salva sessione e stop script
+# Dialog nome sessione
+# -----------------------------------------------------------------------
+def show_name_dialog():
+    global name_dialog, name_textbox, waiting_for_name
+    waiting_for_name = True
+    DW, DH = 260, 104
+
+    name_dialog = API.Gumps.CreateModernGump(220, 220, DW, DH, resizable=False)
+    name_dialog.SetBorderSize(3)
+
+    dbg = API.Gumps.CreateGumpColorBox(0.93, "#0C0C14")
+    dbg.SetRect(0, 0, DW, DH)
+    name_dialog.Add(dbg)
+
+    dtitle = API.Gumps.CreateGumpTTFLabel("Nome sessione", 14, "#E8C030", "alagard")
+    dtitle.SetRect(10, 6, DW, 22)
+    name_dialog.Add(dtitle)
+
+    dsep = API.Gumps.CreateGumpColorBox(1.0, "#E8C030")
+    dsep.SetRect(0, 30, DW, 2)
+    name_dialog.Add(dsep)
+
+    name_textbox = API.Gumps.CreateGumpTextBox("", DW - 20, 26)
+    name_textbox.SetRect(10, 36, DW - 20, 26)
+    name_dialog.Add(name_textbox)
+    name_textbox.SetFocus()
+
+    dbtn = make_btn("Avvia", 20, 140, 60)
+    dbtn.SetRect(DW//2 - 45, 68, 90, 26)
+    name_dialog.Add(dbtn)
+
+    def on_avvia():
+        global session_name, session_coords, session_map, waiting_for_name, name_dialog
+        global session_start, session_active
+        session_name = (name_textbox.Text or "").strip() or "Sessione"
+        session_coords, session_map = snapshot_location()
+        session_start  = datetime.now()
+        session_active = True
+        btn_toggle.SetAlpha(1.0)
+        lbl_name.SetText(session_name)
+        waiting_for_name = False
+        if name_dialog:
+            name_dialog.Dispose()
+            name_dialog = None
+
+    API.Gumps.AddControlOnClick(dbtn, lambda: on_avvia())
+    API.Gumps.AddGump(name_dialog)
+
+# -----------------------------------------------------------------------
+# Callbacks
 # -----------------------------------------------------------------------
 def on_close():
     if kill_count > 0:
-        save_session(session_start, datetime.now(), total_exp, kill_count, total_paused, exp_per_kill)
+        save_session(session_start, datetime.now(), total_exp, kill_count,
+                     total_paused, exp_per_kill, session_name, session_coords, session_map)
         API.SysMsg("ExpCounter: sessione salvata.")
     API.Stop()
 
 API.Gumps.AddControlOnDisposed(gump, on_close)
 API.Gumps.AddGump(gump)
-
-# registra callback click (ApiUiNiceButton non ha HasBeenClicked)
-API.Gumps.AddControlOnClick(btn_pausa,    lambda: do_pausa())
-API.Gumps.AddControlOnClick(btn_riprendi, lambda: do_riprendi())
-API.Gumps.AddControlOnClick(btn_nuovo,    lambda: do_nuovo())
-API.Gumps.AddControlOnClick(btn_storico,  lambda: open_storico())
+API.Gumps.AddControlOnClick(btn_close,   lambda: do_close())
+API.Gumps.AddControlOnClick(btn_toggle,  lambda: do_toggle_pausa())
+API.Gumps.AddControlOnClick(btn_nuovo,   lambda: do_nuovo())
+API.Gumps.AddControlOnClick(btn_storico, lambda: open_storico())
 
 # -----------------------------------------------------------------------
-# Helpers
+# Azioni
 # -----------------------------------------------------------------------
-def fmt_time(seconds):
-    s = max(int(seconds), 0)
-    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-
-def fmt_num(n):
-    return f"{int(n):,}".replace(",", ".")
-
-def get_elapsed():
-    raw = (datetime.now() - session_start).total_seconds()
-    cur_pause = (datetime.now() - paused_at).total_seconds() if (paused and paused_at) else 0.0
-    return max(raw - total_paused - cur_pause, 0.0)
-
 def update_gump():
+    if not session_active:
+        return
     elapsed = get_elapsed()
     hours   = elapsed / 3600.0 if elapsed > 0 else 0.0001
-
-    avg  = total_exp / kill_count if kill_count > 0 else 0
-    rate = total_exp / hours
-    kph  = kill_count / hours
-
+    avg     = total_exp / kill_count if kill_count > 0 else 0
     lbl_total.SetText(fmt_num(total_exp))
     lbl_kill.SetText(str(kill_count))
     lbl_avg.SetText(fmt_num(avg))
     lbl_time.SetText(fmt_time(elapsed))
-    lbl_rate.SetText(fmt_num(rate))
-    lbl_kph.SetText(f"{kph:.1f}")
+    lbl_rate.SetText(fmt_num(total_exp / hours))
+    lbl_kph.SetText(f"{kill_count / hours:.1f}")
     if exp_per_kill:
         lbl_last.SetText(fmt_num(exp_per_kill[-1][1]))
 
-    recent = exp_per_kill[-8:][::-1]
-    for i, rl in enumerate(recent_labels):
-        if i < len(recent):
-            ts, xp = recent[i]
-            rl.SetText(f"  {ts.strftime('%H:%M:%S')}  +{fmt_num(xp)} px")
-        else:
-            rl.SetText("")
+def do_close():
+    if kill_count > 0:
+        save_session(session_start, datetime.now(), total_exp, kill_count,
+                     total_paused, exp_per_kill, session_name, session_coords, session_map)
+        API.SysMsg("ExpCounter: sessione salvata.")
+    API.Stop()
 
-def do_pausa():
-    global paused, paused_at
-    if paused:
-        return
-    paused    = True
-    paused_at = datetime.now()
-    lbl_status_live.SetAlpha(0.0)
-    lbl_status_paused.SetAlpha(1.0)
-    API.SysMsg("ExpCounter: in pausa.")
-
-def do_riprendi():
+def do_toggle_pausa():
     global paused, paused_at, total_paused
-    if not paused:
+    if not session_active:
         return
-    if paused_at is not None:
-        total_paused += (datetime.now() - paused_at).total_seconds()
-    paused    = False
-    paused_at = None
-    lbl_status_live.SetAlpha(1.0)
-    lbl_status_paused.SetAlpha(0.0)
-    API.SysMsg("ExpCounter: ripreso.")
+    if not paused:
+        paused    = True
+        paused_at = datetime.now()
+        lbl_status_live.SetAlpha(0.0)
+        lbl_status_paused.SetAlpha(1.0)
+        btn_toggle.SetText("Riprendi")
+        btn_toggle.SetBackgroundColor(20, 140, 60, 210)
+        API.SysMsg("ExpCounter: in pausa.")
+    else:
+        if paused_at is not None:
+            total_paused += (datetime.now() - paused_at).total_seconds()
+        paused    = False
+        paused_at = None
+        lbl_status_live.SetAlpha(1.0)
+        lbl_status_paused.SetAlpha(0.0)
+        btn_toggle.SetText("Pausa")
+        btn_toggle.SetBackgroundColor(180, 90, 15, 210)
+        API.SysMsg("ExpCounter: ripreso.")
 
 def do_nuovo():
     global total_exp, kill_count, exp_per_kill, last_journal_time
-    global session_start, paused, paused_at, total_paused
-    if kill_count > 0:
-        save_session(session_start, datetime.now(), total_exp, kill_count, total_paused, exp_per_kill)
+    global session_start, paused, paused_at, total_paused, session_active
+    if session_active and kill_count > 0:
+        save_session(session_start, datetime.now(), total_exp, kill_count,
+                     total_paused, exp_per_kill, session_name, session_coords, session_map)
         API.SysMsg("ExpCounter: sessione precedente salvata.")
     total_exp         = 0
     kill_count        = 0
     exp_per_kill      = []
     last_journal_time = None
-    session_start     = datetime.now()
     paused            = False
     paused_at         = None
     total_paused      = 0.0
+    session_active    = False
+    btn_toggle.SetAlpha(0.0)
+    btn_toggle.SetText("Pausa")
+    btn_toggle.SetBackgroundColor(180, 90, 15, 210)
     lbl_status_live.SetAlpha(1.0)
     lbl_status_paused.SetAlpha(0.0)
-    update_gump()
-    API.SysMsg("ExpCounter: nuovo contatore avviato.")
+    show_name_dialog()
 
 def open_storico():
     sessions = load_sessions()
@@ -303,90 +317,93 @@ def open_storico():
         API.SysMsg("ExpCounter: nessuna sessione salvata.")
         return
 
-    SW = 420
-    row_h = 20
-    header_y = 52
-    n = len(sessions)
-    content_h = n * row_h
-    scroll_h = min(content_h, 260)
-    SH = header_y + scroll_h + 12
+    SW       = 620
+    row_h    = 28
+    header_y = 58
+    n        = len(sessions)
+    scroll_h = min(n * row_h, 350)
+    SH       = header_y + scroll_h + 16
 
-    sg = API.Gumps.CreateModernGump(160, 130, SW, SH, resizable=True)
+    sg = API.Gumps.CreateModernGump(150, 120, SW, SH, resizable=True)
+    sg.SetBorderSize(3)
 
-    sbg = API.Gumps.CreateGumpColorBox(0.88, "#080808")
+    sbg = API.Gumps.CreateGumpColorBox(0.93, "#0C0C14")
     sbg.SetRect(0, 0, SW, SH)
     sg.Add(sbg)
 
-    stitle = API.Gumps.CreateGumpTTFLabel("  Storico Sessioni", 15, "#FFD700", "alagard")
-    stitle.SetRect(0, 8, SW, 20)
+    hbg = API.Gumps.CreateGumpColorBox(0.40, "#1A1A2E")
+    hbg.SetRect(0, 0, SW, 32)
+    sg.Add(hbg)
+
+    stitle = API.Gumps.CreateGumpTTFLabel("  Storico Sessioni", 17, "#E8C030", "alagard")
+    stitle.SetRect(0, 6, SW, 26)
     sg.Add(stitle)
 
-    ssep = API.Gumps.CreateGumpColorBox(0.9, "#FFD700")
-    ssep.SetRect(8, 30, SW - 16, 2)
-    sg.Add(ssep)
+    sgsep = API.Gumps.CreateGumpColorBox(1.0, "#E8C030")
+    sgsep.SetRect(0, 34, SW, 2)
+    sg.Add(sgsep)
 
-    # intestazioni colonne
-    col = [("Data / ora", 0, 95), ("Durata", 97, 58), ("PX totali", 157, 80), ("Kill", 240, 38), ("PX / ora", 281, 80), ("in pausa", 363, 55)]
-    for txt, x, w in col:
-        lh = API.Gumps.CreateGumpTTFLabel(txt, 10, "#777777")
-        lh.SetRect(x, 34, w, 16)
+    cols = [
+        ("Nome",   0,  110), ("Mappa", 112,  80), ("Coord", 194, 90),
+        ("Data",   286, 90), ("Durata",378,  58), ("PX",    438, 90), ("Kill", 530, 44),
+    ]
+    for txt, x, w in cols:
+        lh = API.Gumps.CreateGumpTTFLabel(txt, 12, "#505060")
+        lh.SetRect(x + 4, 38, w, 18)
         sg.Add(lh)
 
-    scroll = API.Gumps.CreateGumpScrollArea(8, header_y, SW - 16, scroll_h)
+    scroll = API.Gumps.CreateGumpScrollArea(6, header_y, SW - 12, scroll_h)
     sg.Add(scroll)
 
-    for i, s in enumerate(reversed(sessions)):
+    for i, s in enumerate(sessions[::-1]):
         y = i * row_h
         try:
-            start_dt  = datetime.strptime(s["start"], "%Y-%m-%dT%H:%M:%S")
-            end_dt    = datetime.strptime(s["end"],   "%Y-%m-%dT%H:%M:%S")
-            t_paused  = s.get("paused_sec", 0)
-            raw_dur   = (end_dt - start_dt).total_seconds()
-            active    = max(raw_dur - t_paused, 0)
-            hours     = active / 3600.0 if active > 0 else 0.0001
-            t_exp     = s.get("total_exp", 0)
-            k_count   = s.get("kill_count", 0)
+            start_dt = datetime.strptime(s["start"], DT_FMT)
+            end_dt   = datetime.strptime(s["end"],   DT_FMT)
+            t_paused = s.get("paused_sec", 0)
+            active   = max((end_dt - start_dt).total_seconds() - t_paused, 0)
+            t_exp    = s.get("total_exp", 0)
+            k_count  = s.get("kill_count", 0)
+            coords   = s.get("coords", [0, 0, 0])
+            coord_s  = str(coords[0]) + "," + str(coords[1])
 
-            date_str  = start_dt.strftime("%d/%m/%y %H:%M")
-            dur_str   = fmt_time(active)
-            exp_str   = fmt_num(t_exp)
-            pxh_str   = fmt_num(t_exp / hours)
-            pau_str   = fmt_time(t_paused)
-
-            # riga alternata
             if i % 2 == 0:
-                row_bg = API.Gumps.CreateGumpColorBox(0.12, "#FFFFFF")
-                row_bg.SetRect(0, y, SW - 16, row_h - 1)
-                scroll.Add(row_bg)
+                rb = API.Gumps.CreateGumpColorBox(0.07, "#FFFFFF")
+                rb.SetRect(0, y, SW - 12, row_h - 1)
+                scroll.Add(rb)
 
             c = "#CCCCCC" if i % 2 == 0 else "#999999"
 
             def add(txt, x, w, color=c):
-                lb = API.Gumps.CreateGumpTTFLabel(txt, 10, color)
-                lb.SetRect(x, y + 3, w, 16)
+                lb = API.Gumps.CreateGumpTTFLabel(txt, 13, color)
+                lb.SetRect(x + 4, y + 6, w, 18)
                 scroll.Add(lb)
 
-            add(date_str, 0,   95)
-            add(dur_str,  97,  58)
-            add(exp_str,  157, 80,  "#00FF99")
-            add(str(k_count), 240, 38, "#00CFFF")
-            add(pxh_str,  281, 80,  "#FF6688")
-            add(pau_str,  363, 55,  "#888888")
-
+            add(s.get("name", "—"),                    0,  110)
+            add(s.get("map",  "—"),                   112,  80)
+            add(coord_s,                               194,  90)
+            add(start_dt.strftime("%d/%m %H:%M"),      286,  90)
+            add(fmt_time(active),                      378,  58)
+            add(fmt_num(t_exp),                        438,  90, "#00E87A")
+            add(str(k_count),                          530,  44, "#00CCFF")
         except Exception:
             pass
 
     API.Gumps.AddGump(sg)
 
 # -----------------------------------------------------------------------
-# Main loop
+# Main
 # -----------------------------------------------------------------------
 API.ClearJournal("px")
-API.SysMsg("ExpCounter avviato. Chiudi il gump per fermare.")
+API.SysMsg("ExpCounter avviato.")
 
 while True:
-    # leggi journal solo se non in pausa
-    if not paused:
+    API.ProcessCallbacks()
+    if waiting_for_name:
+        API.Pause(0.1)
+        continue
+
+    if session_active and not paused:
         entries = API.GetJournalEntries(5)
         if entries:
             for entry in entries:
@@ -394,7 +411,6 @@ while True:
                     continue
                 if last_journal_time is None or entry.Time > last_journal_time:
                     last_journal_time = entry.Time
-
                 m = PX_PATTERN.search(entry.Text)
                 if m:
                     raw = m.group(1).replace(".", "").replace(",", "")
@@ -407,5 +423,4 @@ while True:
                         pass
 
     update_gump()
-    API.ProcessCallbacks()
     API.Pause(0.5)

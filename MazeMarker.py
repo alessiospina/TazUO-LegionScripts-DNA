@@ -1,8 +1,15 @@
+# Autore:      Alessio Spina
+# Descrizione: Permette di aggiungere, modificare o rimuovere manualmente tile
+#              nel file maze_v2_data.json. Tramite un gump si sceglie la modalita'
+#              (Verde, Rosso, Blu, Cancella) e si clicca il tile nel mondo.
+#              Se si cancella un tile BLU o un suo landing, rimuove anche
+#              la voce corrispondente dalla lista portali.
+
 import API
 import os
 import json
 
-DATA_FILE = os.path.join(os.path.dirname(API.ScriptPath), "maze_data.json")
+DATA_FILE = os.path.join(os.path.dirname(API.ScriptPath), "maze_v2_data.json")
 
 S_GREEN = 1
 S_RED   = 2
@@ -14,26 +21,40 @@ S_COLOR = {S_GREEN: "#00CC00", S_RED: "#CC2222", S_BLUE: "#2288FF", 0: "#888888"
 
 MODE_DELETE = 0
 
-def load_tiles():
+def load_raw():
     if not os.path.exists(DATA_FILE):
-        return []
+        return {"tiles": [], "portals": []}
     try:
         with open(DATA_FILE, "r") as f:
-            return json.load(f).get("tiles", [])
+            raw = json.load(f)
+        if "portals" not in raw:
+            raw["portals"] = []
+        return raw
     except Exception:
-        return []
+        return {"tiles": [], "portals": []}
 
-def save_tiles(tiles):
+def save_raw(raw):
     with open(DATA_FILE, "w") as f:
-        json.dump({"tiles": tiles}, f)
+        json.dump(raw, f)
 
-def apply_tile(tx, ty, mode, tiles):
-    # Rimuove voce esistente per questo tile (qualunque tipo fosse)
+def apply_tile(tx, ty, mode, raw):
+    tiles   = raw.get("tiles", [])
+    portals = raw.get("portals", [])
+
+    # Rimuovi voce esistente per questo tile
     tiles = [t for t in tiles if not (t[0] == tx and t[1] == ty)]
     API.RemoveMarkedTile(tx, ty)
 
     if mode == MODE_DELETE:
+        # Rimuovi anche portali che referenziano questo tile
+        portals_before = len(portals)
+        portals = [p for p in portals
+                   if not (p[0] == tx and p[1] == ty)
+                   and not (p[2] == tx and p[3] == ty)]
+        portals_removed = portals_before - len(portals)
         msg = "Rimosso (" + str(tx) + "," + str(ty) + ")"
+        if portals_removed > 0:
+            msg += " + " + str(portals_removed) + " portali"
         hue = 33
     else:
         tiles.append([int(tx), int(ty), int(mode)])
@@ -41,14 +62,16 @@ def apply_tile(tx, ty, mode, tiles):
         msg = "Aggiunto " + S_LABEL[mode] + " (" + str(tx) + "," + str(ty) + ")"
         hue = S_MARK[mode]
 
-    save_tiles(tiles)
+    raw["tiles"]   = tiles
+    raw["portals"] = portals
+    save_raw(raw)
     API.SysMsg(msg + " | tot=" + str(len(tiles)), hue)
-    return tiles, msg
+    return raw, msg
 
 def main():
-    mode    = [S_GREEN]   # modalita' corrente
-    do_sel  = [False]     # richiesta selezione tile
-    do_exit = [False]     # richiesta uscita
+    mode    = [S_GREEN]
+    do_sel  = [False]
+    do_exit = [False]
 
     # ── Gump ──────────────────────────────────────────────────────
     GW, GH = 300, 170
@@ -58,12 +81,10 @@ def main():
     bg.SetRect(0, 0, GW, GH)
     g.Add(bg)
 
-    # Label modalita' corrente
     lbl_mode = API.CreateGumpTTFLabel("Modalita': VERDE", 13, S_COLOR[S_GREEN])
     lbl_mode.SetRect(8, 4, GW - 16, 20)
     g.Add(lbl_mode)
 
-    # Bottoni modalita'
     BTN_W, BTN_H = 62, 28
     modes_def = [
         (S_GREEN,     "Verde",    10),
@@ -82,19 +103,16 @@ def main():
             return cb
         API.AddControlOnClick(btn, make_mode_cb(m))
 
-    # Bottone seleziona tile
     btn_sel = API.CreateSimpleButton("Seleziona tile", 180, 30)
     btn_sel.SetRect(10, 68, 180, 30)
     g.Add(btn_sel)
     def on_sel(): do_sel[0] = True
     API.AddControlOnClick(btn_sel, on_sel)
 
-    # Label status
     lbl_status = API.CreateGumpTTFLabel("Pronto.", 11, "#AAAAAA")
     lbl_status.SetRect(8, 106, GW - 16, 18)
     g.Add(lbl_status)
 
-    # Bottone esci
     btn_exit = API.CreateSimpleButton("Esci", 80, 26)
     btn_exit.SetRect(110, 132, 80, 26)
     g.Add(btn_exit)
@@ -102,10 +120,11 @@ def main():
     API.AddControlOnClick(btn_exit, on_exit)
 
     API.AddGump(g)
-    API.SysMsg("MazeMarker avviato.", 88)
+    API.SysMsg("MazeMarker (V2) avviato.", 88)
 
-    tiles = load_tiles()
-    API.SysMsg("Caricati " + str(len(tiles)) + " tile.", 68)
+    raw = load_raw()
+    API.SysMsg("Caricati " + str(len(raw["tiles"])) + " tile, " +
+               str(len(raw["portals"])) + " portali.", 68)
 
     # ── Loop ──────────────────────────────────────────────────────
     while not do_exit[0]:
@@ -118,7 +137,7 @@ def main():
             tgt = API.RequestAnyTarget(60)
             if tgt:
                 tx, ty = int(tgt.X), int(tgt.Y)
-                tiles, msg = apply_tile(tx, ty, mode[0], tiles)
+                raw, msg = apply_tile(tx, ty, mode[0], raw)
                 lbl_status.SetText(msg)
             else:
                 lbl_status.SetText("Nessun target selezionato.")

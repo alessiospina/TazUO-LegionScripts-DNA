@@ -1,7 +1,7 @@
-# Author:      Alessio Spina
-# Date:        2026-05-11
-# Description: Primo click: cerca la pergamena di livello piu' alto e mostra preview.
-#              Secondo click entro 3s: la lancia direttamente senza cercare di nuovo.
+# Autore:      Alessio Spina
+# Descrizione: Al primo click cerca la pergamena di livello piu' alto nello zaino
+#              e mostra una preview. Al secondo click entro 3s la lancia direttamente
+#              sull'ultimo target senza cercare di nuovo.
 
 import re
 import time

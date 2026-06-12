@@ -1,3 +1,8 @@
+# Autore:      Alessio Spina
+# Descrizione: Lancia l'incantesimo invisibilita' (.castmago 17) e mostra un countdown
+#              grafico con barra di progresso. La durata e' calcolata dal livello del
+#              personaggio. Lo script si ferma se il personaggio torna visibile.
+
 import API
 import re
 import os

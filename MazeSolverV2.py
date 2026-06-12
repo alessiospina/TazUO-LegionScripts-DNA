@@ -1,6 +1,14 @@
+# Autore:      Alessio Spina
+# Descrizione: Esplora e classifica automaticamente i tile di un labirinto via BFS.
+#              Ogni tile viene classificato come Verde (calpestabile), Rosso (rimanda
+#              allo start), Blu (portale verso zona nuova) o Muro (impassibile).
+#              Gestisce zone disconnesse tramite un grafo di portali, visualizza
+#              la mappa in tempo reale su un gump e salva lo stato su JSON.
+
 import API
 import os
 import json
+import time as _time
 
 # ── Costanti ────────────────────────────────────────────────────
 
@@ -39,6 +47,12 @@ STALL_LIMIT = 25
 SAVE_EVERY  = 25
 TELE_DIST   = 3   # Chebyshev > TELE_DIST = teleport reale, non lag
 
+# Stanza da monitorare: se il player ci entra lo script si mette in pausa
+DANGER_X_MIN = 5147
+DANGER_X_MAX = 5162
+DANGER_Y_MIN = 2412
+DANGER_Y_MAX = 2438
+
 # Palette per colorare le zone (verdi mantengono famiglia di tinte verdi)
 ZONE_PALETTE = [
     (0, 180, 0),
@@ -51,6 +65,10 @@ ZONE_PALETTE = [
     (100, 200, 0),
     (60, 160, 100),
 ]
+
+
+def _bms(name, t):
+    API.SysMsg("[B] " + name + " " + str(int((_time.time()-t)*1000)) + "ms", 68)
 
 
 # ── Union-Find sui tile verdi ──────────────────────────────────
@@ -140,10 +158,11 @@ class Maze:
 # ── Persistenza ────────────────────────────────────────────────
 
 def load_maze(maze):
+    _t = _time.time()
     for t in KNOWN_BAD:
         maze.set(t, S_RED)
     if not os.path.exists(DATA_FILE):
-        return
+        _bms("load_maze", _t); return
     try:
         with open(DATA_FILE, "r") as f:
             raw = json.load(f)
@@ -158,27 +177,29 @@ def load_maze(maze):
                    str(len(maze.portals)) + " portali.", 68)
     except Exception:
         API.SysMsg("Errore lettura dati, riparto.", 33)
+    _bms("load_maze", _t)
 
 
 def save_maze(maze):
+    _t = _time.time()
     tiles = [[int(t[0]), int(t[1]), int(k)] for t, k in maze.state.items()]
     portals = [[int(b[0]), int(b[1]), int(l[0]), int(l[1])]
                for b, l in maze.portals.items()]
     with open(DATA_FILE, "w") as f:
         json.dump({"tiles": tiles, "portals": portals}, f)
+    _bms("save_maze", _t)
 
 
 # ── A* intra-zona ──────────────────────────────────────────────
 
 def astar_green(start, goal, maze):
+    _t = _time.time()
     if maze.kind(goal) != S_GREEN:
-        return None
-    # Se start non e' verde, accetta che la prima mossa sia su un verde adiacente
+        _bms("astar", _t); return None
     if maze.kind(start) != S_GREEN:
-        return None
+        _bms("astar", _t); return None
     if maze.zone_of(start) != maze.zone_of(goal):
-        return None
-
+        _bms("astar", _t); return None
     gx, gy = goal
     def h(p): return abs(p[0]-gx) + abs(p[1]-gy)
     open_list = [(h(start), start)]
@@ -197,7 +218,7 @@ def astar_green(start, goal, maze):
                 path.append(cur)
                 cur = came[cur]
             path.append(start)
-            return path[::-1]
+            _bms("astar", _t); return path[::-1]
         cx, cy = cur
         for dx, dy, _ in DIRS:
             nb = (cx+dx, cy+dy)
@@ -208,15 +229,14 @@ def astar_green(start, goal, maze):
                 came[nb] = cur
                 gscore[nb] = ng
                 open_list.append((ng + h(nb), nb))
-    return None
+    _bms("astar", _t); return None
 
 
 # ── Multi-zona: pianificazione via grafo dei portali ──────────
 
 def build_zone_graph(maze):
-    """Per ogni portale BLU di cui conosciamo il landing, crea un arco
-       (zona_di_blue) -> (zona_di_landing) etichettato (blue, landing)."""
-    edges = {}  # zone_id -> list of (blue, landing, dest_zone)
+    _t = _time.time()
+    edges = {}
     for blue, landing in maze.portals.items():
         src_greens = maze.green_adj(blue)
         if not src_greens:
@@ -226,14 +246,13 @@ def build_zone_graph(maze):
         if src_zone is None or dst_zone is None:
             continue
         edges.setdefault(src_zone, []).append((blue, landing, dst_zone))
-    return edges
+    _bms("build_zone_graph", _t); return edges
 
 
 def plan_zone_path(src_zone, dst_zone, maze):
-    """BFS sul grafo delle zone. Ritorna lista di ('portal', blue, landing)
-       da eseguire in sequenza, oppure None."""
+    _t = _time.time()
     if src_zone == dst_zone:
-        return []
+        _bms("plan_zone_path", _t); return []
     edges = build_zone_graph(maze)
     came = {}
     visited = {src_zone}
@@ -246,50 +265,60 @@ def plan_zone_path(src_zone, dst_zone, maze):
                 src, blue, landing = came[z]
                 actions.append(("portal", blue, landing))
                 z = src
-            return actions[::-1]
+            _bms("plan_zone_path", _t); return actions[::-1]
         for blue, landing, dz in edges.get(z, []):
             if dz in visited:
                 continue
             visited.add(dz)
             came[dz] = (z, blue, landing)
             queue.append(dz)
-    return None
+    _bms("plan_zone_path", _t); return None
 
 
 # ── Movimento di basso livello ─────────────────────────────────
 
-def step_to(sx, sy):
-    """Un passo verso (sx,sy). Ritorna ('ok'|'teleport'|'fail', pos)."""
+def step_to(sx, sy, view=None, maze=None):
+    _t = _time.time()
     cx, cy = int(API.Player.X), int(API.Player.Y)
     if (cx, cy) == (sx, sy):
+        #_bms("step_to", _t); 
         return ("ok", (cx, cy))
     dx, dy = sx - cx, sy - cy
     dname = next((d for ddx, ddy, d in DIRS if ddx == dx and ddy == dy), None)
     if dname is None:
+        #_bms("step_to", _t); 
         return ("fail", (cx, cy))
     API.Turn(dname); API.Pause(0.15)
     API.Run(dname)
-    for _ in range(10):
-        API.Pause(0.2)
-        if (int(API.Player.X), int(API.Player.Y)) == (sx, sy):
+    last_painted = (cx, cy)
+    for _ in range(40):
+        API.Pause(0.05)
+        cur = (int(API.Player.X), int(API.Player.Y))
+        if view is not None and maze is not None and cur != last_painted:
+            view.repaint_tile(last_painted, maze)
+            view.paint_player(cur)
+            last_painted = cur
+        if cur == (sx, sy):
+            #_bms("step_to", _t);
             return ("ok", (sx, sy))
     nx, ny = int(API.Player.X), int(API.Player.Y)
     if max(abs(nx-sx), abs(ny-sy)) > TELE_DIST:
+        #_bms("step_to", _t); 
         return ("teleport", (nx, ny))
+    #_bms("step_to", _t); 
     return ("fail", (nx, ny))
 
 
-def navigate_intra_zone(target, maze):
-    """Cammina via A* su verdi fino a target. Se un tile verde si rivela
-       teleport, lo riclassifica e ritorna False."""
+def navigate_intra_zone(target, maze, view=None):
+    _t = _time.time()
     px, py = int(API.Player.X), int(API.Player.Y)
     if (px, py) == target:
-        return True
+        _bms("navigate", _t); return True
     path = astar_green((px, py), target, maze)
     if not path or len(path) < 2:
-        return False
+        _bms("navigate", _t); return False
     for sx, sy in path[1:]:
-        result, pos = step_to(sx, sy)
+        result, pos = step_to(sx, sy, view=view, maze=maze)
         if result == "ok":
             continue
         if result == "teleport":
@@ -297,52 +326,62 @@ def navigate_intra_zone(target, maze):
             maze.set((sx, sy), kind, landing=pos if kind == S_BLUE else None)
             API.SysMsg("Verde mal-classificato (" + str(sx) + "," + str(sy) +
                        ") -> " + S_LABEL[kind], S_HUE[kind])
-            return False
-        return False
-    return True
+            _bms("navigate", _t); return False
+        _bms("navigate", _t); return False
+    _bms("navigate", _t); return True
 
 
-def classify_step(tx, ty):
-    """Walk su (tx,ty); ritorna (kind, landed)."""
+def classify_step(tx, ty, view=None, maze=None):
+    _t = _time.time()
     cx, cy = int(API.Player.X), int(API.Player.Y)
     dx, dy = tx - cx, ty - cy
     dname = next((d for ddx, ddy, d in DIRS if ddx == dx and ddy == dy), None)
     if dname is None:
-        return (S_WALL, (cx, cy))
+        _bms("classify", _t); return (S_WALL, (cx, cy))
     API.Turn(dname); API.Pause(0.3)
     API.Walk(dname)
     moved = False
-    for _ in range(50):
-        API.Pause(0.2)
-        if (int(API.Player.X), int(API.Player.Y)) != (cx, cy):
+    last_painted = (cx, cy)
+    for _ in range(200):
+        API.Pause(0.05)
+        cur = (int(API.Player.X), int(API.Player.Y))
+        if view is not None and maze is not None and cur != last_painted:
+            view.repaint_tile(last_painted, maze)
+            view.paint_player(cur)
+            last_painted = cur
+        if cur != (cx, cy):
             moved = True
             break
     if not moved:
-        return (S_WALL, (cx, cy))
-    API.Pause(0.35)   # stabilizzazione anti-interpolazione
+        _bms("classify", _t); return (S_WALL, (cx, cy))
+    API.Pause(0.35)
     px, py = int(API.Player.X), int(API.Player.Y)
+    if view is not None and maze is not None and (px, py) != last_painted:
+        view.repaint_tile(last_painted, maze)
+        view.paint_player((px, py))
     if (px, py) == (tx, ty):
-        return (S_GREEN, (px, py))
+        _bms("classify", _t); return (S_GREEN, (px, py))
     if (px, py) == START:
-        return (S_RED, (px, py))
-    return (S_BLUE, (px, py))
+        _bms("classify", _t); return (S_RED, (px, py))
+    _bms("classify", _t); return (S_BLUE, (px, py))
 
 
-def traverse_portal(blue, landing, maze):
-    """Avvicinati al BLU e attraversalo; verifica atterraggio == landing."""
+def traverse_portal(blue, landing, maze, view=None):
+    _t = _time.time()
     src_greens = maze.green_adj(blue)
     if not src_greens:
-        return False
-    if not navigate_intra_zone(src_greens[0], maze):
-        return False
+        _bms("traverse_portal", _t); return False
+    if not navigate_intra_zone(src_greens[0], maze, view=view):
+        _bms("traverse_portal", _t); return False
     cx, cy = int(API.Player.X), int(API.Player.Y)
     dx, dy = blue[0] - cx, blue[1] - cy
     dname = next((d for ddx, ddy, d in DIRS if ddx == dx and ddy == dy), None)
     if dname is None:
-        return False
+        _bms("traverse_portal", _t); return False
     API.Turn(dname); API.Pause(0.1)
     API.Run(dname); API.Pause(0.5)
-    return (int(API.Player.X), int(API.Player.Y)) == landing
+    result = (int(API.Player.X), int(API.Player.Y)) == landing
+    _bms("traverse_portal", _t); return result
 
 
 # ── Display ────────────────────────────────────────────────────
@@ -480,6 +519,7 @@ class StatusView:
 # ── Coda di esplorazione ──────────────────────────────────────
 
 def expand_queue(pos, maze, queue):
+    _t = _time.time()
     x, y = pos
     for dx, dy, _ in DIRS:
         nb = (x+dx, y+dy)
@@ -490,12 +530,11 @@ def expand_queue(pos, maze, queue):
                     maze.set(nb, S_WALL)
                 else:
                     queue.add(nb)
+    _bms("expand", _t)
 
 
 def pick_target_in_zone(queue, maze, px, py, player_zone):
-    """Trova il tile in coda con vicino verde nella zona del player a
-       minima distanza Manhattan dal player. Ritorna (tile, approach) o
-       (None, None)."""
+    _t = _time.time()
     best = None
     best_d = INF_PRIO
     best_app = None
@@ -509,11 +548,11 @@ def pick_target_in_zone(queue, maze, px, py, player_zone):
                     best_d = d
                     best = t
                     best_app = nb
-    return best, best_app
+    _bms("pick_target", _t); return best, best_app
 
 
 def zone_demand(queue, maze):
-    """zone_id -> n tile in coda con un vicino verde in quella zona."""
+    _t = _time.time()
     out = {}
     for t in queue:
         x, y = t
@@ -525,7 +564,7 @@ def zone_demand(queue, maze):
                 if z is not None and z not in seen_zones:
                     seen_zones.add(z)
                     out[z] = out.get(z, 0) + 1
-    return out
+    _bms("zone_demand", _t); return out
 
 
 # ── UI: scelta modalità + scelta portale ──────────────────────
@@ -623,30 +662,32 @@ def pick_blue_tile(maze):
 # ── Modalità manuale: attraversa portale scelto ──────────────
 
 def manual_enter_portal(maze, view):
+    _t = _time.time()
     selected = pick_blue_tile(maze)
     if selected is None:
-        return None
+        _bms("manual_enter_portal", _t); return None
     approach = None
     for dx, dy, _ in DIRS:
         nb = (selected[0]+dx, selected[1]+dy)
         if maze.kind(nb) == S_GREEN:
             approach = nb
             break
-    if approach is None or not navigate_intra_zone(approach, maze):
+    if approach is None or not navigate_intra_zone(approach, maze, view=view):
         API.SysMsg("Non riesco ad avvicinarmi al portale.", 33)
-        return None
-    kind, landed = classify_step(selected[0], selected[1])
+        _bms("manual_enter_portal", _t); return None
+    kind, landed = classify_step(selected[0], selected[1], view=view, maze=maze)
     maze.set(selected, kind, landing=landed if kind == S_BLUE else None)
     view.paint(selected, kind, maze)
     if kind != S_BLUE:
         API.SysMsg("Il tile selezionato e' " + S_LABEL[kind] + ".", 33)
-        return None
+        _bms("manual_enter_portal", _t); return None
     if maze.kind(landed) == S_UNKNOWN:
         maze.set(landed, S_GREEN)
     view.repaint_all(maze)
     save_maze(maze)
     API.SysMsg("Atterrato a " + str(landed), 88)
-    return maze.zone_of(landed)
+    result = maze.zone_of(landed)
+    _bms("manual_enter_portal", _t); return result
 
 
 # ── FSM Explorer ──────────────────────────────────────────────
@@ -693,9 +734,10 @@ class Explorer:
                            self.stall, pzone)
 
     def _step_explore(self):
+        _t = _time.time()
         if not self.queue:
             self.fsm = "DONE"
-            return
+            _bms("_step_explore", _t); return
         px, py = int(API.Player.X), int(API.Player.Y)
         pzone = self.maze.zone_of_player(px, py)
         self._publish(pzone)
@@ -703,21 +745,21 @@ class Explorer:
         if pzone is None:
             API.SysMsg("Player fuori da zone note -> REBOUND", 33)
             self.fsm = "REBOUND"
-            return
+            _bms("_step_explore", _t); return
 
         target, approach = pick_target_in_zone(self.queue, self.maze, px, py, pzone)
         if target is None:
             API.SysMsg("Zona corrente esaurita -> REBOUND", 88)
             self.fsm = "REBOUND"
-            return
+            _bms("_step_explore", _t); return
 
         self.queue.discard(target)
         if self.maze.kind(target) != S_UNKNOWN or target in self.skipped:
-            return
+            _bms("_step_explore", _t); return
 
         self.view.paint_target(target)
 
-        if not navigate_intra_zone(approach, self.maze):
+        if not navigate_intra_zone(approach, self.maze, view=self.view):
             fails = self.nav_fails.get(target, 0) + 1
             self.nav_fails[target] = fails
             if fails >= 3:
@@ -726,14 +768,14 @@ class Explorer:
                            ") ignorato.", 900)
             self.stall += 1
             self._check_stall()
-            return
+            _bms("_step_explore", _t); return
 
         px2, py2 = int(API.Player.X), int(API.Player.Y)
         if max(abs(px2 - target[0]), abs(py2 - target[1])) != 1:
-            return
+            _bms("_step_explore", _t); return
         self.view.paint_player((px2, py2))
 
-        kind, landed = classify_step(target[0], target[1])
+        kind, landed = classify_step(target[0], target[1], view=self.view, maze=self.maze)
         self.maze.set(target, kind, landing=landed if kind == S_BLUE else None)
         self.counts[kind] = self.counts.get(kind, 0) + 1
         self.nav_fails[target] = 0
@@ -743,10 +785,10 @@ class Explorer:
                    S_LABEL[kind], S_HUE[kind])
 
         if kind == S_GREEN:
-            self.view.paint(target, S_GREEN, self.maze)
+            _tp = _time.time(); self.view.paint(target, S_GREEN, self.maze); _bms("paint_green", _tp)
             expand_queue(target, self.maze, self.queue)
         elif kind == S_BLUE:
-            self.view.paint(target, S_BLUE, self.maze)
+            _tp = _time.time(); self.view.paint(target, S_BLUE, self.maze); _bms("paint_blue", _tp)
             if self.maze.kind(landed) == S_UNKNOWN:
                 self.maze.set(landed, S_GREEN)
                 self.counts[S_GREEN] = self.counts.get(S_GREEN, 0) + 1
@@ -754,26 +796,26 @@ class Explorer:
             self.last_landing = landed
             if self.mode == "manual":
                 self.target_zone = self.maze.zone_of(landed)
-            self.view.repaint_all(self.maze)
         elif kind == S_RED:
-            self.view.paint(target, S_RED, self.maze)
+            _tp = _time.time(); self.view.paint(target, S_RED, self.maze); _bms("paint_red", _tp)
         else:
-            self.view.paint(target, S_WALL, self.maze)
+            _tp = _time.time(); self.view.paint(target, S_WALL, self.maze); _bms("paint_wall", _tp)
 
         total = self.counts[S_GREEN] + self.counts[S_BLUE]
         if total > 0 and total % SAVE_EVERY == 0:
             save_maze(self.maze)
         if target == GOAL and kind == S_GREEN:
             API.SysMsg("=== GOAL RAGGIUNTO! ===", 68)
+        _bms("_step_explore", _t)
 
     def _step_rebound(self):
+        _t = _time.time()
         demand = zone_demand(self.queue, self.maze)
         if not demand:
             API.SysMsg("Nessuna zona ha tile in coda. FATTO.", 68)
             self.fsm = "DONE"
-            return
+            _bms("_step_rebound", _t); return
 
-        # Preferenza: manuale -> target_zone se ha domanda; altrimenti zona con piu domanda
         if self.mode == "manual" and self.target_zone in demand:
             tz = self.target_zone
         else:
@@ -785,18 +827,17 @@ class Explorer:
 
         if cur_zone == tz:
             self.fsm = "EXPLORE"
-            return
+            _bms("_step_rebound", _t); return
 
         API.SysMsg("REBOUND -> zona " + str(tz)[-6:] +
                    " (" + str(demand[tz]) + " tile)", 88)
 
         if cur_zone is None:
-            # Non in zona: pathfind a START e ritenta
             API.Pathfind(START[0], START[1], wait=True, timeout=20)
             API.Pause(0.5)
             self.stall += 1
             self._check_stall()
-            return
+            _bms("_step_rebound", _t); return
 
         plan = plan_zone_path(cur_zone, tz, self.maze)
         if not plan:
@@ -804,26 +845,28 @@ class Explorer:
                        str(tz)[-6:] + ".", 33)
             self.stall += 1
             self._check_stall()
-            return
+            _bms("_step_rebound", _t); return
 
         for action in plan:
             if action[0] != "portal":
                 continue
             _, blue, landing = action
-            if not traverse_portal(blue, landing, self.maze):
+            if not traverse_portal(blue, landing, self.maze, view=self.view):
                 API.SysMsg("Portale " + str(blue) + " fallito.", 33)
                 self.stall += 1
                 self._check_stall()
-                return
+                _bms("_step_rebound", _t); return
 
         self.stall = 0
         self.fsm = "EXPLORE"
+        _bms("_step_rebound", _t)
 
     def _step_verify_blue(self):
+        _t = _time.time()
         blue_tiles = [t for t, k in self.maze.state.items() if k == S_BLUE]
         if not blue_tiles:
             self.fsm = "DONE"
-            return
+            _bms("_step_verify_blue", _t); return
         px, py = int(API.Player.X), int(API.Player.Y)
         blue_tiles.sort(key=lambda t: abs(t[0]-px) + abs(t[1]-py))
         pzone = self.maze.zone_of_player(px, py)
@@ -834,13 +877,13 @@ class Explorer:
             adj_greens = self.maze.green_adj(bt)
             if not adj_greens:
                 continue
-            if not navigate_intra_zone(adj_greens[0], self.maze):
+            if not navigate_intra_zone(adj_greens[0], self.maze, view=self.view):
                 continue
             cx, cy = int(API.Player.X), int(API.Player.Y)
             if max(abs(cx-bt[0]), abs(cy-bt[1])) != 1:
                 continue
             self.view.paint_target(bt)
-            kind, landed = classify_step(bt[0], bt[1])
+            kind, landed = classify_step(bt[0], bt[1], view=self.view, maze=self.maze)
             self.maze.set(bt, kind, landing=landed if kind == S_BLUE else None)
             if kind == S_BLUE and self.maze.kind(landed) == S_UNKNOWN:
                 self.maze.set(landed, S_GREEN)
@@ -848,20 +891,24 @@ class Explorer:
             self.view.repaint_all(self.maze)
             save_maze(self.maze)
         self.fsm = "DONE"
+        _bms("_step_verify_blue", _t)
 
 
 # ── Bootstrap ─────────────────────────────────────────────────
 
 def reach_start():
+    _t = _time.time()
     if (int(API.Player.X), int(API.Player.Y)) == START:
-        return True
+        _bms("reach_start", _t); return True
     API.SysMsg("Raggiungo START...", 946)
     API.Pathfind(START[0], START[1], wait=True, timeout=30)
     API.Pause(0.5)
-    return (int(API.Player.X), int(API.Player.Y)) == START
+    result = (int(API.Player.X), int(API.Player.Y)) == START
+    _bms("reach_start", _t); return result
 
 
 def static_prescan(maze):
+    _t = _time.time()
     API.SysMsg("FASE 1: pre-scansione muri statici...", 88)
     statics = API.GetStaticsInArea(X_MIN, Y_MIN, X_MAX, Y_MAX)
     n = 0
@@ -873,6 +920,67 @@ def static_prescan(maze):
                     maze.set(pos, S_WALL)
                     n += 1
     API.SysMsg("Muri pre-classificati: " + str(n), 900)
+    _bms("static_prescan", _t)
+
+
+# ── Stanza pericolosa ─────────────────────────────────────────
+
+def _in_danger_room(px, py):
+    return (DANGER_X_MIN <= px <= DANGER_X_MAX and
+            DANGER_Y_MIN <= py <= DANGER_Y_MAX)
+
+
+def _danger_room_pause(maze, explorer):
+    for _ in range(4):
+        API.SysMsg("!!! STANZA PERICOLOSA RILEVATA !!!", 32)
+        API.Pause(0.25)
+
+    GW, GH = 380, 130
+    g = API.CreateGump(True, True, True)
+    g.SetRect(380, 260, GW, GH)
+    bg = API.CreateGumpColorBox(0.95, "#1a0000")
+    bg.SetRect(0, 0, GW, GH)
+    g.Add(bg)
+
+    lbl = API.CreateGumpTTFLabel("!!! STANZA PERICOLOSA !!!", 14, "#FF4444")
+    lbl.SetRect(10, 8, GW - 20, 22)
+    g.Add(lbl)
+
+    pos_lbl = API.CreateGumpTTFLabel(
+        "Posizione: (" + str(int(API.Player.X)) + ", " + str(int(API.Player.Y)) + ")",
+        11, "#FFAAAA")
+    pos_lbl.SetRect(10, 36, GW - 20, 16)
+    g.Add(pos_lbl)
+
+    btn_cont = API.CreateSimpleButton("Continua", 140, 34)
+    btn_stop = API.CreateSimpleButton("Salva e Chiudi", 170, 34)
+    btn_cont.SetRect(20,  76, 140, 34)
+    btn_stop.SetRect(200, 76, 170, 34)
+    g.Add(btn_cont)
+    g.Add(btn_stop)
+
+    choice = [None]
+    def on_cont(): choice[0] = "continue"
+    def on_stop(): choice[0] = "stop"
+    API.AddControlOnClick(btn_cont, on_cont)
+    API.AddControlOnClick(btn_stop, on_stop)
+    API.AddGump(g)
+
+    while choice[0] is None:
+        API.ProcessCallbacks()
+        API.Pause(0.1)
+
+    g.Dispose()
+
+    if choice[0] == "stop":
+        save_maze(maze)
+        API.SysMsg("Salvato. Script in chiusura.", 68)
+        explorer.aborted_reason = "Chiuso dall'utente: stanza pericolosa."
+        explorer.fsm = "ABORT"
+        return True
+
+    API.SysMsg("Ripresa esplorazione.", 68)
+    return False
 
 
 # ── Main ──────────────────────────────────────────────────────
@@ -919,6 +1027,7 @@ def main():
     explorer.seed_queue()
 
     prev_player = None
+    danger_dismissed = False
     while not explorer.is_terminal():
         cur_player = (int(API.Player.X), int(API.Player.Y))
         if cur_player != prev_player:
@@ -926,6 +1035,7 @@ def main():
                 view.repaint_tile(prev_player, maze)
             view.paint_player(cur_player)
             prev_player = cur_player
+
         explorer.step()
         API.Pause(0.05)
 
